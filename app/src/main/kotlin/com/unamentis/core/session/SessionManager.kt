@@ -747,8 +747,15 @@ class SessionManager(
                         Log.d("SessionManager", "STT: ${result.text} (final=${result.isFinal})")
 
                         if (result.isFinal) {
-                            // Final transcription received
-                            handleFinalTranscription(result.text)
+                            // Final transcription received.
+                            // IMPORTANT: hand off to a NEW coroutine. handleFinalTranscription
+                            // cancels sttJob (this collector) and then suspends in
+                            // sttService.stopStreaming() - if it ran inside this job, the
+                            // self-cancellation would surface as CancellationException at the
+                            // first suspension point and the LLM would never be called.
+                            scope.launch {
+                                handleFinalTranscription(result.text)
+                            }
                         }
                     }
                 } catch (e: CancellationException) {
@@ -838,9 +845,18 @@ class SessionManager(
      * Handle final transcription from STT.
      */
     private suspend fun handleFinalTranscription(text: String) {
-        // Stop STT
+        // Stop the STT collector job. This runs in its own coroutine (see startSTTStreaming),
+        // so cancelling sttJob here is safe and won't cancel the processing below.
         sttJob?.cancel()
-        sttService.stopStreaming()
+        try {
+            sttService.stopStreaming()
+        } catch (e: CancellationException) {
+            // Concurrent cancellation of the collector; the recognizer is torn down by
+            // callbackFlow's awaitClose anyway.
+            Log.w("SessionManager", "STT stop cancelled (expected during hand-off)")
+        } catch (e: Exception) {
+            Log.e("SessionManager", "STT stop error", e)
+        }
 
         val trimmedText = text.trim()
         val speechDuration = System.currentTimeMillis() - userSpeechStartTime
